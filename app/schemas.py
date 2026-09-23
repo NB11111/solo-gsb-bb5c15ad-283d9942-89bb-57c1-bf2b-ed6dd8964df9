@@ -243,3 +243,98 @@ class JobOut(BaseModel):
     created_at: str
     aligned_at: str | None
     result: AlignmentResult | None = None
+
+
+# ---- 跨任务合奏一致性 POST /ensembles/consensus ----
+
+
+class ConsensusRequest(BaseModel):
+    job_ids: list[int] = Field(
+        ...,
+        min_length=3,
+        description=(
+            "参与合奏一致性分析的已完成任务 ID（每个任务一条演奏轨），"
+            "至少 3 个；不可重复，且所有任务的参考节拍网格必须完全相同"
+        ),
+    )
+    deviation_threshold: float = Field(
+        ..., gt=0, description="秒级异常阈值：校正时间相对合奏基准 |偏差| 严格大于该值报异常"
+    )
+
+
+class EnsembleMissedBeat(BaseModel):
+    ref_index: int
+    beat_number: int
+    ref_time: float
+
+
+class EnsembleTrack(BaseModel):
+    job_id: int = Field(..., description="该演奏轨对应的任务 ID")
+    name: str | None
+    delay: float | None = Field(
+        ...,
+        description=(
+            "估计出的固定录音延迟（秒）：匹配拍 (perf_time−ref_time) 的中位数；"
+            "无匹配拍时为 null"
+        ),
+    )
+    matched_beat_count: int
+    missed_beat_count: int
+    missed_beats: list[EnsembleMissedBeat] = Field(
+        default_factory=list, description="该轨漏拍清单（逐轨列出）"
+    )
+
+
+class EnsembleOutlier(BaseModel):
+    job_id: int
+    corrected_time: float = Field(..., description="该轨该拍校正后的演奏时间（秒）")
+    deviation: float = Field(
+        ..., description="相对合奏基准的偏差（秒，校正时间−基准）；负=抢拍，正=拖拍"
+    )
+    status: BeatStatus
+
+
+class EnsembleBeat(BaseModel):
+    ref_index: int
+    beat_number: int
+    ref_time: float
+    decidable: bool = Field(
+        ..., description="匹配轨数 ≥ 3 时为 true；false=覆盖不足，不可判定且不报异常"
+    )
+    matched_track_count: int
+    consensus_time: float | None = Field(
+        ..., description="合奏基准（各轨校正时间的中位数，秒）；不可判定时为 null"
+    )
+    matched_job_ids: list[int] = Field(
+        ..., description="匹配该拍的轨对应任务 ID（按提交顺序）"
+    )
+    missing_job_ids: list[int] = Field(
+        ..., description="漏该拍（未匹配）的轨对应任务 ID（按提交顺序）"
+    )
+    outlier_count: int
+    outliers: list[EnsembleOutlier] = Field(
+        default_factory=list,
+        description="偏离合奏基准超过阈值的轨（任务 ID + 偏差）；不可判定拍恒为空",
+    )
+
+
+class EnsembleConsensusOut(BaseModel):
+    parameters: dict[str, Any]
+    job_ids: list[int] = Field(..., description="本次参与的任务 ID（按提交顺序）")
+    reference_beats: list[float] = Field(
+        ..., description="所有任务共享的参考节拍网格（秒）"
+    )
+    reference_beat_count: int
+    track_count: int
+    tracks: list[EnsembleTrack] = Field(
+        ..., description="各轨结果：固定录音延迟、匹配拍数与逐轨漏拍"
+    )
+    beat_count: int
+    decidable_beat_count: int = Field(..., description="可判定拍数（≥3 轨匹配）")
+    undecidable_beat_count: int = Field(
+        ..., description="不可判定拍数（匹配轨不足 3，不报异常）"
+    )
+    outlier_count: int
+    beats: list[EnsembleBeat] = Field(
+        ..., description="按参考拍顺序排列的每拍合奏结果"
+    )

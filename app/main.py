@@ -19,8 +19,11 @@ from .alignment import (
     validate_anchors,
 )
 from .database import get_db, init_db
+from .ensemble import EnsembleError, build_consensus
 from .review import ReviewError, extract_review_segments
 from .schemas import (
+    ConsensusRequest,
+    EnsembleConsensusOut,
     JobCreate,
     JobOut,
     JobSummary,
@@ -38,7 +41,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="多轨录音节拍对齐 API",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "提交参考节拍网格与演奏轨音符起始时间，服务使用带宽约束的动态时间规整"
         "（Sakoe-Chiba DTW）处理漏拍、抢拍与插入拍，回溯生成一一对应映射及"
@@ -46,6 +49,10 @@ app = FastAPI(
         "锚点作为硬约束把 DTW 限制在相邻锚点之间分段寻优，合并为完整对齐路径。"
         "已完成的任务可调用 /jobs/{id}/review-segments，按偏差阈值与可容忍拍间隔"
         "把漏拍、插入音及超阈值偏差聚合成复核片段（拍号范围 + 问题摘要）。"
+        "多个共享同一参考节拍网格的已完成任务可调用 /ensembles/consensus："
+        "先以各轨匹配拍偏差中位数估计并校正固定录音延迟，再按参考拍汇总，"
+        "至少 3 轨匹配的拍取校正时间中位数为合奏基准并列出超阈值异常任务，"
+        "覆盖不足的拍标记为不可判定且不报异常。"
     ),
     lifespan=lifespan,
 )
@@ -295,3 +302,81 @@ def get_job_review_segments(
             detail=str(exc),
         )
     return {"job_id": job_id, **review}
+
+
+@app.post(
+    "/ensembles/consensus",
+    response_model=EnsembleConsensusOut,
+    status_code=status.HTTP_200_OK,
+    tags=["ensembles"],
+)
+def ensemble_consensus(
+    payload: ConsensusRequest,
+    db: sqlite3.Connection = Depends(get_db),
+):
+    """跨任务合奏一致性分析（按需计算、只读，不落库）。
+
+    提交**至少 3 个已完成**任务 ID（每任务一条演奏轨）与秒级异常阈值：
+
+    - 重复 ID：400；任务不存在：404；任务未对齐（`pending`）/无对齐结果：409；
+      上次对齐失败（`error`）：400；参考节拍网格不完全相同：422；
+      阈值非正或任务数不足 3：422。
+
+    对每条轨以匹配拍 ``perf_time − ref_time`` 的**中位数**估计固定录音延迟并
+    校正演奏时间；再按参考拍汇总各轨校正时间，**至少 3 轨匹配**时取中位数为
+    合奏基准，并列出偏离基准严格超过阈值的任务 ID 与偏差（early/late）。
+    匹配轨不足 3 的拍标记为**不可判定**且不报异常；漏拍逐轨列出。
+    """
+    if len(set(payload.job_ids)) != len(payload.job_ids):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="任务 ID 不可重复",
+        )
+
+    jobs = []
+    for job_id in payload.job_ids:
+        job = crud.get_job(db, job_id)
+        if job is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"任务 {job_id} 不存在",
+            )
+        if job["status"] == "pending":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"任务 {job_id} 尚未对齐",
+            )
+        if job["status"] == "error":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"任务 {job_id} 上次对齐失败：{job['error']}",
+            )
+        if job["result"] is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"任务 {job_id} 尚无对齐结果，"
+                    "请先调用 /jobs/{id}/align 执行对齐"
+                ),
+            )
+        jobs.append(job)
+
+    reference_beats = jobs[0]["reference_beats"]
+    for job in jobs[1:]:
+        if job["reference_beats"] != reference_beats:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"任务 {jobs[0]['id']} 与任务 {job['id']} 的参考节拍网格"
+                    "不完全相同，合奏一致性仅接受完全一致的参考节拍网格"
+                ),
+            )
+
+    try:
+        consensus = build_consensus(jobs, payload.deviation_threshold)
+    except EnsembleError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        )
+    return consensus

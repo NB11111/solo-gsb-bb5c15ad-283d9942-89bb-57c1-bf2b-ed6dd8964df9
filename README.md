@@ -20,6 +20,11 @@
 **可容忍的拍间隔**，把对齐结果中的漏拍、插入音及超阈值偏差按参考拍顺序聚合成
 若干片段，返回每个片段的**拍号范围**与**问题摘要**，供人工逐段复核。
 
+多条共享**同一参考节拍网格**的演奏轨（≥3 个已完成任务）还可做**跨任务合奏
+一致性（ensemble consensus）**分析：先用各轨匹配拍偏差的中位数估计并扣除固定
+录音延迟，再按参考拍取各轨校正时间的中位数为合奏基准，列出偏离基准超过秒级
+阈值的任务；覆盖不足 3 轨的拍标记为不可判定，漏拍逐轨列出。
+
 ## 目录结构
 
 ```
@@ -29,11 +34,13 @@
 │   ├── alignment.py     # 带宽约束 DTW 核心算法（纯标准库，含锚点分段对齐）
 │   ├── tempo.py         # 节奏曲线（tempo map）估计：中位数窗口 + 稳定区间压缩
 │   ├── review.py        # 复核片段提取：漏拍/插入音/超阈值偏差按参考拍聚合
+│   ├── ensemble.py      # 跨任务合奏一致性：逐轨延迟校正 + 逐拍中位数基准
 │   ├── schemas.py       # Pydantic 请求/响应模型
 │   ├── database.py      # SQLite 连接、建表与旧库迁移
 │   └── crud.py          # 任务读写
 ├── tests/               # unittest 测试（对齐算法 18 个 + 节奏曲线 10 个
-│                        #   + 复核片段 14 个 + 接口 25 个）
+│                        #   + 复核片段 14 个 + 合奏一致性 10 个
+│                        #   + 接口 30 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -51,6 +58,9 @@ docker compose up --build
 - 健康检查：`GET http://localhost:8000/health`
 - 复核片段接口示例：
   `GET http://localhost:8000/jobs/1/review-segments?deviation_threshold=0.05&gap_tolerance_beats=2`
+- 合奏一致性接口示例：
+  `POST http://localhost:8000/ensembles/consensus`
+  （请求体 `{"job_ids": [1, 2, 3], "deviation_threshold": 0.05}`）
 - SQLite 数据文件：容器内 `/data/alignment.db`，由命名卷 `beat-data` 持久化
 
 配置（均通过环境变量，见 `docker-compose.yml`）：
@@ -95,6 +105,7 @@ PYTHONPATH=. python -m unittest discover -s tests -v
 | GET    | `/jobs/{id}/result`        | 只查询对齐结果（含已采用锚点）         |
 | GET    | `/jobs/{id}/tempo-map`     | 从 matched_beats 导出节奏曲线（tempo events） |
 | GET    | `/jobs/{id}/review-segments` | 提取复核片段：漏拍/插入音/超阈值偏差按参考拍聚合（拍号范围 + 摘要） |
+| POST   | `/ensembles/consensus`     | 跨任务合奏一致性：逐轨固定延迟校正后按参考拍取中位数基准，列出超阈值异常任务 |
 | GET    | `/jobs`                    | 任务列表（摘要，按创建时间倒序）       |
 | GET    | `/health`                  | 健康检查                               |
 
@@ -173,7 +184,12 @@ curl -s "http://localhost:8000/jobs/$ID/tempo-map?window_beats=5&min_bpm=40&max_
 # 5) 提取复核片段（偏差阈值 0.05s，问题相距不超过 2 拍则合并）
 curl -s "http://localhost:8000/jobs/$ID/review-segments?deviation_threshold=0.05&gap_tolerance_beats=2"
 
-# 6) 列出全部任务
+# 6) 跨任务合奏一致性（至少 3 个已完成任务，秒级异常阈值 0.05s）
+curl -s -X POST http://localhost:8000/ensembles/consensus \
+  -H 'Content-Type: application/json' \
+  -d '{"job_ids": [1, 2, 3], "deviation_threshold": 0.05}'
+
+# 7) 列出全部任务
 curl -s http://localhost:8000/jobs
 ```
 
@@ -394,6 +410,99 @@ print("插入拍:", [b["perf_index"] for b in result["inserted_beats"]])
 缺失）返回 `409` 并提示先调用 `/jobs/{id}/align`；上次对齐失败 `400`；
 参数非法（阈值非正、可容忍间隔为负）`422`。
 
+## 跨任务合奏一致性（`POST /ensembles/consensus`）
+
+提交**至少 3 个已完成**任务 ID（每个任务对应一条演奏轨）与**秒级异常阈值**，
+对共享**完全相同的参考节拍网格**的多条演奏轨做合奏一致性分析。该接口按需
+计算、只读，不修改任何任务的对齐结果，也不落库。
+
+请求体：
+
+```json
+{
+  "job_ids": [1, 2, 3, 4],
+  "deviation_threshold": 0.05
+}
+```
+
+- `job_ids`：已完成（`status=done`）任务 ID 列表，**至少 3 个**、**不可重复**；
+  各任务的 `reference_beats` 必须**逐值完全相同**（长度与每个时间点都相等）。
+- `deviation_threshold`：秒级异常阈值（必须 > 0）。校正后的演奏时间相对合奏
+  基准的偏差 `|偏差|` **严格大于**该值才报异常。
+
+处理流程：
+
+1. **固定录音延迟校正**：每条轨以其匹配拍 `perf_time − ref_time` 的**中位数**
+   估计该轨的固定录音延迟（中位数不受个别抢 / 拖拍影响），并把演奏时间校正为
+   `corrected_time = perf_time − delay`。没有匹配拍的轨延迟为 `null`，不参与
+   任何拍的基准计算。
+2. **逐拍合奏基准**：按参考拍汇总各轨校正时间，仅当**至少 3 轨**匹配该拍时，
+   取校正时间的**中位数**为合奏基准（`consensus_time`）；偏离基准严格超过阈值
+   的轨列入 `outliers`，给出任务 ID、校正时间、带符号偏差（负=抢拍 `early`、
+   正=拖拍 `late`）。
+3. **覆盖不足**：匹配轨数不足 3 的拍 `decidable=false`，不返回合奏基准
+   （`consensus_time=null`），**不报异常**（`outliers=[]`）。每拍同时给出
+   `matched_job_ids` / `missing_job_ids`；各轨漏拍另在 `tracks[].missed_beats`
+   中**逐轨列出**（0 基索引、1 基拍号与参考时间）。
+
+响应示例（4 轨、第 3 拍仅 1 轨匹配不可判定；第 4 拍轨 4 拖拍 0.09s）：
+
+```json
+{
+  "parameters": {"deviation_threshold": 0.05, "min_tracks_per_beat": 3},
+  "job_ids": [1, 2, 3, 4],
+  "reference_beats": [0.0, 0.5, 1.0, 1.5, 2.0],
+  "reference_beat_count": 5,
+  "track_count": 4,
+  "tracks": [
+    {"job_id": 1, "name": "violin", "delay": 0.012,
+     "matched_beat_count": 5, "missed_beat_count": 0, "missed_beats": []},
+    {"job_id": 4, "name": "cello", "delay": -0.02,
+     "matched_beat_count": 4, "missed_beat_count": 1,
+     "missed_beats": [{"ref_index": 2, "beat_number": 3, "ref_time": 1.0}]}
+  ],
+  "beat_count": 5,
+  "decidable_beat_count": 4,
+  "undecidable_beat_count": 1,
+  "outlier_count": 1,
+  "beats": [
+    {"ref_index": 2, "beat_number": 3, "ref_time": 1.0,
+     "decidable": false, "matched_track_count": 1, "consensus_time": null,
+     "matched_job_ids": [1], "missing_job_ids": [2, 3, 4],
+     "outlier_count": 0, "outliers": []},
+    {"ref_index": 3, "beat_number": 4, "ref_time": 1.5,
+     "decidable": true, "matched_track_count": 4, "consensus_time": 1.498,
+     "matched_job_ids": [1, 2, 3, 4], "missing_job_ids": [],
+     "outlier_count": 1,
+     "outliers": [
+       {"job_id": 4, "corrected_time": 1.588,
+        "deviation": 0.09, "status": "late"}
+     ]}
+  ]
+}
+```
+
+- `tracks[].delay`：该轨固定录音延迟（秒，匹配拍偏差中位数）；无匹配拍为
+  `null`。校正时间 = 原始演奏时间 − 该延迟。
+- `beats[]` 按参考拍顺序排列；`decidable=false` 的拍**不会**出现异常项。
+- 顶层 `decidable_beat_count` / `undecidable_beat_count` / `outlier_count`
+  分别为可判定拍数、不可判定拍数与全部可判定拍上的异常总数。
+
+错误：
+
+- `400` 任务 ID 重复，或引用了上次对齐失败（`error`）的任务；
+- `404` 任一任务 ID 不存在；
+- `409` 引用了尚未对齐（`pending`）或无对齐结果（`result` 缺失）的任务；
+- `422` 任务数少于 3、阈值非正，或任务之间参考节拍网格不完全相同。
+
+调用示例：
+
+```bash
+curl -s -X POST http://localhost:8000/ensembles/consensus \
+  -H 'Content-Type: application/json' \
+  -d '{"job_ids": [1, 2, 3, 4], "deviation_threshold": 0.05}'
+```
+
 ## 算法说明
 
 设参考拍 `r₀..rₙ₋₁`、演奏音 `p₀..pₘ₋₁`，代价矩阵单元
@@ -442,4 +551,8 @@ D(i,j) = min of  ⎨ D(i−1,j)   + skip_penalty          漏拍（水平）
 - `400` `/tempo-map` 或 `/review-segments` 作用于上次对齐失败（`error`）的任务
 - `422` 请求体校验失败（空序列、非递增、字段类型错误等），
   或查询参数非法（`min_bpm >= max_bpm`、`window_beats` 越界、
-  `deviation_threshold ≤ 0`、`gap_tolerance_beats < 0`）
+  `deviation_threshold ≤ 0`、`gap_tolerance_beats < 0`）；
+  合奏一致性任务数不足 3、阈值非正或参考节拍网格不一致同样返回 `422`
+- 合奏一致性（`POST /ensembles/consensus`）：任务 ID 重复或引用上次对齐
+  失败的任务返回 `400`；任务不存在 `404`；任务尚未对齐或无对齐结果
+  返回 `409`；成功为 `200`
