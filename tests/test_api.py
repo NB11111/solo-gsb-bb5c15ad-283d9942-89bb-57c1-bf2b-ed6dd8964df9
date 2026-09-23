@@ -652,5 +652,176 @@ class TestAPI(unittest.TestCase):
         self.assertEqual(r.status_code, 422)
 
 
+class TestEnsembleConsensusAPI(unittest.TestCase):
+    """POST /ensembles/consensus 跨任务合奏一致性接口。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._cm = TestClient(app)
+        cls.client = cls._cm.__enter__()
+        cls.addClassCleanup(cls._cm.__exit__, None, None, None)
+
+    def _done_job(self, ref, perf, **extra):
+        body = {"reference_beats": ref, "performance_onsets": perf}
+        body.update(extra)
+        r = self.client.post("/jobs", json=body)
+        self.assertEqual(r.status_code, 201, r.text)
+        job_id = r.json()["id"]
+        r = self.client.post(f"/jobs/{job_id}/align")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "done")
+        return job_id
+
+    def test_consensus_full_flow(self):
+        # 三轨同一网格：轨 b 带 +0.1s 固定延迟（被校正），
+        # 轨 c 仅在第 4 拍（索引 3）拖拍 0.2s -> 唯一异常
+        ref = [0.0, 0.5, 1.0, 1.5, 2.0]
+        a = self._done_job(ref, [0.0, 0.51, 0.99, 1.5, 2.0])
+        b = self._done_job(ref, [0.1, 0.6, 1.1, 1.6, 2.1])
+        c = self._done_job(ref, [0.0, 0.5, 1.0, 1.7, 2.0])
+        r = self.client.post("/ensembles/consensus", json={
+            "job_ids": [a, b, c],
+            "deviation_threshold": 0.05,
+        })
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        self.assertEqual(data["job_ids"], [a, b, c])
+        self.assertEqual(data["ref_beat_count"], 5)
+        self.assertEqual(data["parameters"]["deviation_threshold"], 0.05)
+        self.assertEqual(data["parameters"]["min_tracks_per_beat"], 3)
+
+        # 各轨延迟：b 的固定录音延迟被估计为 0.1s
+        tracks = {t["job_id"]: t for t in data["tracks"]}
+        self.assertAlmostEqual(tracks[a]["latency"], 0.0, places=6)
+        self.assertAlmostEqual(tracks[b]["latency"], 0.1, places=6)
+        self.assertAlmostEqual(tracks[c]["latency"], 0.0, places=6)
+        self.assertEqual(tracks[a]["matched_count"], 5)
+        self.assertEqual(tracks[a]["missed_beats"], [])
+
+        # 第 4 拍：校正后 1.5 / 1.5 / 1.7 -> 基准 1.5，c 偏离 +0.2 为异常
+        beat3 = data["beats"][3]
+        self.assertEqual(beat3["ref_index"], 3)
+        self.assertEqual(beat3["ref_time"], 1.5)
+        self.assertTrue(beat3["decidable"])
+        self.assertEqual(beat3["covered_count"], 3)
+        self.assertAlmostEqual(beat3["baseline"], 1.5, places=6)
+        self.assertEqual(len(beat3["entries"]), 3)
+        self.assertEqual(len(beat3["anomalies"]), 1)
+        self.assertEqual(beat3["anomalies"][0]["job_id"], c)
+        self.assertAlmostEqual(
+            beat3["anomalies"][0]["deviation"], 0.2, places=6
+        )
+        self.assertEqual(data["anomaly_count"], 1)
+        self.assertEqual(data["decidable_beat_count"], 5)
+        self.assertEqual(data["undecidable_beat_count"], 0)
+
+    def test_consensus_missed_beat_makes_beat_undecidable(self):
+        # 轨 c 漏第 3 拍（索引 2）-> 该拍仅 2 轨覆盖，不可判定；
+        # 尽管 a/b 在该拍相差 0.3s 也不报异常；漏拍逐轨列出
+        ref = [0.0, 0.5, 1.0, 1.5, 2.0]
+        a = self._done_job(ref, [0.0, 0.5, 1.0, 1.5, 2.0])
+        b = self._done_job(ref, [0.0, 0.5, 1.3, 1.5, 2.0])
+        c = self._done_job(ref, [0.0, 0.5, 1.5, 2.0])
+        r = self.client.post("/ensembles/consensus", json={
+            "job_ids": [a, b, c],
+            "deviation_threshold": 0.05,
+        })
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        beat2 = data["beats"][2]
+        self.assertEqual(beat2["covered_count"], 2)
+        self.assertFalse(beat2["decidable"])
+        self.assertIsNone(beat2["baseline"])
+        self.assertEqual(beat2["anomalies"], [])
+        self.assertTrue(all(e["offset"] is None for e in beat2["entries"]))
+        self.assertEqual(data["anomaly_count"], 0)
+        self.assertEqual(data["undecidable_beat_count"], 1)
+        tracks = {t["job_id"]: t for t in data["tracks"]}
+        self.assertEqual(
+            tracks[c]["missed_beats"], [{"ref_index": 2, "ref_time": 1.0}]
+        )
+        self.assertEqual(tracks[a]["missed_beats"], [])
+        self.assertEqual(tracks[b]["missed_beats"], [])
+
+    def test_consensus_four_tracks_even_median(self):
+        # 支持 3 轨以上：4 轨时基准取中间两个校正时间的平均
+        ref = [0.0, 0.5, 1.0, 1.5, 2.0]
+        ids = [self._done_job(ref, list(ref)) for _ in range(3)]
+        ids.append(self._done_job(ref, [0.09, 0.5, 1.0, 1.5, 2.0]))
+        r = self.client.post("/ensembles/consensus", json={
+            "job_ids": ids,
+            "deviation_threshold": 0.05,
+        })
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        beat0 = data["beats"][0]
+        self.assertEqual(beat0["covered_count"], 4)
+        self.assertEqual(beat0["baseline"], 0.0)
+        self.assertEqual(
+            beat0["anomalies"], [{"job_id": ids[3], "deviation": 0.09}]
+        )
+        self.assertEqual(data["anomaly_count"], 1)
+
+    def test_consensus_request_validation(self):
+        # 少于 3 个任务 ID -> 422
+        r = self.client.post("/ensembles/consensus",
+                             json={"job_ids": [1, 2]})
+        self.assertEqual(r.status_code, 422)
+        # 重复任务 ID -> 422
+        r = self.client.post("/ensembles/consensus",
+                             json={"job_ids": [1, 1, 2]})
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("重复", r.text)
+        # 阈值非正 -> 422
+        r = self.client.post("/ensembles/consensus", json={
+            "job_ids": [1, 2, 3], "deviation_threshold": 0,
+        })
+        self.assertEqual(r.status_code, 422)
+        r = self.client.post("/ensembles/consensus", json={
+            "job_ids": [1, 2, 3], "deviation_threshold": -0.1,
+        })
+        self.assertEqual(r.status_code, 422)
+
+    def test_consensus_error_states(self):
+        ref = [0.0, 0.5, 1.0, 1.5, 2.0]
+        a = self._done_job(ref, list(ref))
+        b = self._done_job(ref, list(ref))
+
+        # 404：任务不存在
+        r = self.client.post("/ensembles/consensus",
+                             json={"job_ids": [a, b, 999999]})
+        self.assertEqual(r.status_code, 404)
+
+        # 409：任务尚未对齐（pending）
+        r = self.client.post("/jobs", json={
+            "reference_beats": ref, "performance_onsets": list(ref),
+        })
+        pending_id = r.json()["id"]
+        r = self.client.post("/ensembles/consensus",
+                             json={"job_ids": [a, b, pending_id]})
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("对齐", r.json()["detail"])
+
+        # 400：上次对齐失败（error）
+        from app import crud, database
+        conn = database.connect()
+        try:
+            crud.save_error(conn, pending_id, "boom")
+        finally:
+            conn.close()
+        r = self.client.post("/ensembles/consensus",
+                             json={"job_ids": [a, b, pending_id]})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("boom", r.json()["detail"])
+
+        # 400：参考节拍网格不一致
+        c = self._done_job([0.0, 0.5, 1.0, 1.5, 2.5],
+                           [0.0, 0.5, 1.0, 1.5, 2.5])
+        r = self.client.post("/ensembles/consensus",
+                             json={"job_ids": [a, b, c]})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("网格", r.json()["detail"])
+
+
 if __name__ == "__main__":
     unittest.main()

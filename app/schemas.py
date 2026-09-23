@@ -219,6 +219,92 @@ class ReviewSegmentsOut(BaseModel):
     )
 
 
+class ConsensusRequest(BaseModel):
+    job_ids: list[int] = Field(
+        ..., min_length=3,
+        description="参与合奏一致性分析的已完成任务ID（至少 3 个，不得重复）",
+    )
+    deviation_threshold: float = Field(
+        default=0.05, gt=0,
+        description=(
+            "异常阈值（秒）：|校正时间 − 合奏基准| 严格大于该值的任务列为异常"
+        ),
+    )
+
+    @field_validator("job_ids")
+    @classmethod
+    def _unique_job_ids(cls, v: list[int]) -> list[int]:
+        if len(set(v)) != len(v):
+            raise ValueError("任务ID不得重复")
+        return v
+
+
+class ConsensusMissedBeat(BaseModel):
+    ref_index: int
+    ref_time: float
+
+
+class ConsensusTrack(BaseModel):
+    job_id: int
+    latency: float | None = Field(
+        ...,
+        description=(
+            "固定录音延迟估计（秒）：该轨匹配拍 perf_time−ref_time 的中位数，"
+            "已从演奏时间中扣除；无匹配拍时为 null"
+        ),
+    )
+    matched_count: int = Field(..., description="该轨的匹配拍数")
+    missed_beats: list[ConsensusMissedBeat] = Field(
+        default_factory=list, description="该轨的漏拍（参考拍索引与时间）"
+    )
+
+
+class ConsensusBeatEntry(BaseModel):
+    job_id: int
+    corrected_time: float = Field(
+        ..., description="扣除该轨固定延迟后的演奏时间（秒）"
+    )
+    offset: float | None = Field(
+        ..., description="相对合奏基准的带符号偏差（秒）；拍不可判定时为 null"
+    )
+
+
+class ConsensusAnomaly(BaseModel):
+    job_id: int
+    deviation: float = Field(
+        ..., description="相对合奏基准的带符号偏差（秒），绝对值严格大于阈值"
+    )
+
+
+class ConsensusBeat(BaseModel):
+    ref_index: int
+    ref_time: float
+    covered_count: int = Field(..., description="该参考拍上有匹配拍的轨数")
+    decidable: bool = Field(
+        ..., description="覆盖轨数达到 min_tracks_per_beat 才可判定；否则不报异常"
+    )
+    baseline: float | None = Field(
+        ..., description="合奏基准（各轨校正时间的中位数，秒）；不可判定时为 null"
+    )
+    entries: list[ConsensusBeatEntry] = Field(
+        default_factory=list, description="各轨在该拍的校正时间与相对基准偏差"
+    )
+    anomalies: list[ConsensusAnomaly] = Field(
+        default_factory=list, description="偏离基准超过阈值的任务（仅可判定时给出）"
+    )
+
+
+class ConsensusOut(BaseModel):
+    job_ids: list[int]
+    parameters: dict[str, Any]
+    ref_beat_count: int
+    decidable_beat_count: int
+    undecidable_beat_count: int
+    anomaly_count: int = Field(..., description="全部可判定拍上的异常总数")
+    tracks: list[ConsensusTrack]
+    beats: list[ConsensusBeat]
+
+
 class JobSummary(BaseModel):
     id: int
     name: str | None

@@ -19,8 +19,11 @@ from .alignment import (
     validate_anchors,
 )
 from .database import get_db, init_db
+from .ensemble import EnsembleError, build_consensus
 from .review import ReviewError, extract_review_segments
 from .schemas import (
+    ConsensusOut,
+    ConsensusRequest,
     JobCreate,
     JobOut,
     JobSummary,
@@ -38,7 +41,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="多轨录音节拍对齐 API",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "提交参考节拍网格与演奏轨音符起始时间，服务使用带宽约束的动态时间规整"
         "（Sakoe-Chiba DTW）处理漏拍、抢拍与插入拍，回溯生成一一对应映射及"
@@ -46,6 +49,9 @@ app = FastAPI(
         "锚点作为硬约束把 DTW 限制在相邻锚点之间分段寻优，合并为完整对齐路径。"
         "已完成的任务可调用 /jobs/{id}/review-segments，按偏差阈值与可容忍拍间隔"
         "把漏拍、插入音及超阈值偏差聚合成复核片段（拍号范围 + 问题摘要）。"
+        "多个使用完全相同参考网格的已完成任务还可提交 /ensembles/consensus 做"
+        "跨任务合奏一致性分析：估计并校正各轨固定录音延迟，按参考拍取多轨校正"
+        "时间中位数作为合奏基准，列出偏离基准超过阈值的任务与偏差。"
     ),
     lifespan=lifespan,
 )
@@ -295,3 +301,66 @@ def get_job_review_segments(
             detail=str(exc),
         )
     return {"job_id": job_id, **review}
+
+
+@app.post(
+    "/ensembles/consensus",
+    response_model=ConsensusOut,
+    tags=["ensembles"],
+)
+def ensemble_consensus(
+    payload: ConsensusRequest,
+    db: sqlite3.Connection = Depends(get_db),
+):
+    """跨任务合奏一致性分析（按需计算、只读）。
+
+    提交至少 3 个**已完成**且使用**完全相同参考节拍网格**的任务 ID 及秒级
+    异常阈值。处理流程：
+
+    1. 对每轨，以其匹配拍的 ``perf_time − ref_time`` 中位数估计固定录音
+       延迟，并从演奏时间中扣除（校正）；
+    2. 按参考拍汇总各轨校正时间：覆盖至少 3 轨的拍取中位数作为**合奏
+       基准**，``|校正时间 − 基准|`` 严格大于阈值的任务列入该拍
+       ``anomalies``（含任务 ID 与带符号偏差）；
+    3. 覆盖不足 3 轨的拍标记 ``decidable=false``（基准为 null），不报
+       异常；各轨漏拍在 ``tracks[].missed_beats`` 中逐轨列出。
+
+    响应同时给出各轨延迟（``tracks[].latency``）与每拍结果（``beats``）。
+
+    - 任务 ID 少于 3 个、重复或阈值非正：422
+    - 任务不存在：404；任务尚未对齐（pending）：409；上次对齐失败：400
+    - 参考节拍网格不完全相同：400
+    """
+    jobs: list[dict] = []
+    for job_id in payload.job_ids:
+        job = crud.get_job(db, job_id)
+        if job is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"任务 {job_id} 不存在",
+            )
+        if job["status"] == "pending":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"任务 {job_id} 尚未对齐，请先调用 /jobs/{job_id}/align",
+            )
+        if job["status"] == "error":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"任务 {job_id} 上次对齐失败：{job['error']}",
+            )
+        if job["result"] is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"任务 {job_id} 尚无对齐结果",
+            )
+        jobs.append(job)
+
+    try:
+        return build_consensus(
+            jobs, deviation_threshold=payload.deviation_threshold
+        )
+    except EnsembleError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        )
